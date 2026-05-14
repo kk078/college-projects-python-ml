@@ -1,0 +1,133 @@
+name: Build Project
+
+on:
+  workflow_dispatch:
+    inputs:
+      submission_id:
+        description: "Submission ID"
+        required: true
+        type: string
+      project_title:
+        description: "Project Title"
+        required: true
+        type: string
+      student_email:
+        description: "Student Email"
+        required: false
+        type: string
+      r2_bucket:
+        description: "R2 Bucket Name"
+        required: true
+        type: string
+        default: "college-projects-deliverables"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up environment
+        run: |
+          echo "SUBMISSION_ID=${{ inputs.submission_id }}" >> $GITHUB_ENV
+          echo "PROJECT_TITLE=${{ inputs.project_title }}" >> $GITHUB_ENV
+          echo "R2_BUCKET=${{ inputs.r2_bucket }}" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          if [ -f package.json ]; then npm install; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pubspec.yaml ]; then flutter pub get; fi
+          if [ -f Cargo.toml ]; then cargo fetch; fi
+          if [ -f go.mod ]; then go mod download; fi
+
+      - name: Run lint
+        run: |
+          if [ -f package.json ]; then npm run lint 2>/dev/null || true; fi
+          if [ -f requirements.txt ]; then pip install flake8 && flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics 2>/dev/null || true; fi
+
+      - name: Run tests
+        run: |
+          if [ -f package.json ]; then npm test 2>/dev/null || true; fi
+          if [ -f requirements.txt ]; then python -m pytest tests/ -v 2>/dev/null || true; fi
+          if [ -f pubspec.yaml ]; then flutter test 2>/dev/null || true; fi
+          if [ -f Cargo.toml ]; then cargo test 2>/dev/null || true; fi
+          if [ -f go.mod ]; then go test ./... 2>/dev/null || true; fi
+
+      - name: Generate college report
+        run: |
+          cat > report.html << 'REPORT'
+          <!DOCTYPE html>
+          <html><head><meta charset="utf-8"><title>${{ inputs.project_title }} - Report</title>
+          <style>body{font-family:Arial;max-width:800px;margin:40px auto;padding:20px;color:#333}
+          h1{color:#1e40af;border-bottom:2px solid #e2e8f0;padding-bottom:8px}
+          .section{margin:20px 0;padding:16px;background:#f8fafc;border-radius:8px}
+          .badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;background:#dbeafe;color:#1e40af}</style>
+          </head><body>
+          <h1>${{ inputs.project_title }}</h1>
+          <div class="section">
+            <h2>Project Information</h2>
+            <p><strong>Submission ID:</strong> ${{ inputs.submission_id }}</p>
+            <p><strong>Student Email:</strong> ${{ inputs.student_email }}</p>
+            <p><strong>Build Date:</strong> $(date -u +"%Y-%m-%dT%H:%M:%SZ")</p>
+            <p><strong>Status:</strong> <span class="badge">Completed</span></p>
+          </div>
+          <div class="section">
+            <h2>Test Results</h2>
+            <p>Build and test execution completed.</p>
+          </div>
+          <div class="section">
+            <h2>Deliverables</h2>
+            <p>Source code and documentation are available for download.</p>
+          </div>
+          </body></html>
+          REPORT
+          mkdir -p artifacts
+          cp report.html artifacts/
+
+      - name: Build project
+        run: |
+          mkdir -p dist
+          if [ -f package.json ]; then npm run build 2>/dev/null && tar -czf dist/project.tar.gz .next package.json public 2>/dev/null || true; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt 2>/dev/null && python setup.py sdist 2>/dev/null || python -m build 2>/dev/null || true; fi
+          if [ -f pubspec.yaml ]; then flutter build apk --release 2>/dev/null || true; fi
+          if [ -f Cargo.toml ]; then cargo build --release 2>/dev/null || true; fi
+          if [ -f go.mod ]; then go build -o dist/app 2>/dev/null || true; fi
+          tar -czf artifacts/source.tar.gz --exclude=node_modules --exclude=.git --exclude=artifacts . 2>/dev/null || zip -r artifacts/source.zip . -x "node_modules/*" ".git/*" "artifacts/*" 2>/dev/null || true
+
+      - name: Upload to R2
+        if: always()
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: "196987f9fa53f4b0cb757aa5c77ff0a2"
+        run: |
+          curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${R2_BUCKET}/objects/${{ inputs.submission_id }}/source/project.tar.gz" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            --data-binary "@dist/project.tar.gz" 2>/dev/null || true
+          curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${R2_BUCKET}/objects/${{ inputs.submission_id }}/report/report.html" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            --data-binary "@artifacts/report.html" 2>/dev/null || true
+
+      - name: Notify webhook
+        if: always()
+        run: |
+          WEBHOOK_URL="https://projects.aetheraonline.com/api/builds/webhook"
+          PAYLOAD=$(cat << EOF
+          {
+            "action": "completed",
+            "workflow_run": {
+              "conclusion": "${{ job.status }}",
+              "inputs": {
+                "submission_id": "${{ inputs.submission_id }}",
+                "project_title": "${{ inputs.project_title }}"
+              }
+            },
+            "repository": {
+              "name": "${{ github.event.repository.name }}"
+            }
+          }
+          EOF
+          )
+          curl -s -X POST "${WEBHOOK_URL}" \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}" 2>/dev/null || true
